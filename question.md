@@ -289,3 +289,100 @@ ATTNL0@81.10  W2L0@81.17  ATTN/W2/SCALE of L1,L2,L3 @81.5–82.4   (被劈开的
 - 它是**逐层产生又释放的临时区**，单 token、短上下文下激活很小，且反复在很小一块内复用 → 整片只蹭到约 0.7%，其余自然空白。
 
 **一句话：它不是"忘了访问"，而是"本来就是干活的临时台面，干完就空着了"。**
+
+---
+
+# 附：L24 单层地址图（张量排布 / 小标量 / 62 个 kernel）
+
+## Q20. v5_L24_alladdr.png 里 MoE 55.835–56.741 的红线很稀疏，和"激活 10/512 专家"有关吗？
+
+有关，就是 10/512。该 MoE 段（906MB）由 4 个大张量组成：
+
+| 地址(GB) | 大小 | 张量 |
+|---|---|---|
+| 55.835–55.868 | 33.55MB | `routed_experts.w2_weight_scale` |
+| 55.868–55.935 | 67.11MB | `routed_experts.w13_weight_scale` |
+| 55.935–56.204 | 268.4MB | `routed_experts.w2_weight`(down) |
+| 56.204–56.741 | 536.9MB | `routed_experts.w13_weight`(gate+up) |
+
+w13 是 `[512 experts,…]`、每专家 1.05MB；w2 每专家 0.52MB。**一个 token 只激活 top-10 专家**，专家按 index 分散在张量里 → 只读到 10 小段（≈10MB）/ 每层层 906MB → **红线稀疏 = 10/512**，红线位置就是那 10 个专家的偏移。
+
+## Q21. 纵轴"MoE、attention、shared、激活、MoE、norm、attention…交错"是真实的吗？各类型对应哪些张量？
+
+**是真实的**（按真实地址排序）。L24 是**线性注意力(GDN)**层，其张量在 HBM 上真实排布（节选）：
+
+```
+MoE 55.835–56.741  (w2_scale, w13_scale, w2_weight, w13_weight)
+attention 56.741–56.791  (linear_attn.in_proj_qkvz.weight)
+shared/norm 56.791
+attention/norm 57.756–57.762 (out_proj, mlp.gate)
+attn/shared 57.775–57.777
+一堆 0.00MB 的 scale/alpha 60.685
+激活 81/85GB（不是 L24 的存储，是它访问的共享激活地址）
+```
+
+各类型张量（L24）：
+- **MoE**：`routed_experts.w13_weight`(537MB)、`w2_weight`(268MB)、`w13_weight_scale`(67MB)、`w2_weight_scale`(34MB) + 每专家标量 ≈906MB/512 专家
+- **attention(GDN)**：`linear_attn.in_proj_qkvz.weight`、`out_proj.weight(+scale)`、`conv1d.weight`、`in_proj_ba.weight`、`A_log`、`dt_bias`、`norm.weight`、scale/alpha ≈55MB
+- **shared**：`shared_expert.gate_up_proj/down_proj`(+scale) + 全局 scale/alpha ≈1.8MB
+- **norm/路由**：`input_layernorm`、`post_attention_layernorm`、`mlp.gate.weight` ≈2.1MB
+- **scale**：`weight_scale/alpha/global_scale/input_scale`（按名字归入其父类，不单列）
+
+> 注意：图里标"激活/KV"的段不是 L24 的存储，而是 L24 的 kernel **访问到**的共享激活/workspace、KV 地址，按其真实位置画在低位/高位。
+
+## Q22. `MoE 56.791–56.791`、`MoE 60.685–60.685` 怎么解释？和 55.835–56.741 同类型吗？
+
+同一数据类型（都属于 routed_experts/量化参数），但**不是那 4 个大张量**，而是**每专家标量小张量**：
+
+| 地址(GB) | 大小 | 张量 |
+|---|---|---|
+| 56.7915 | 2KB | `routed_experts.w2_input_scale` |
+| 56.7915 | 2KB | `routed_experts.w2_weight_scale_2` |
+| 60.6853 | 2KB | `routed_experts.w13_weight_scale_2` |
+| 35.2887 | 2KB | `routed_experts.w13_input_scale` |
+
+它们被放在"小张量堆放区"（56.79、60.685 等），同处混着别的类型小张量；分段规则"同类型且相邻才合并"，被别类型隔开就各自成段；又因断轴图给**最小显示高度**，所以 2KB 的标量看起来和 906MB 的大块差不多高（并不代表它真的大）。
+
+## Q23. 图例里有土黄的 scale，但地址空间里没看到 scale 色块？
+
+"scale"指 NVFP4 量化参数（`weight_scale/weight_scale_2/input_scale/global_scale/alpha`）。但本图类型判定是**先把 scale 归到其父模块**：`.experts.` → MoE(红)、`shared_expert` → shared(紫)、`linear_attn` → attention(橙)。因此 L24 里没有张量落进独立的 `scale` 类 → 土黄空着（scale 被"染"成了父类颜色）。若要单独显示，可把 `*_scale/alpha/...` 一律标为 `scale`（则 MoE 大块变 805MB，另 101MB scale 变土黄）。
+
+## Q24. 为什么热图里"其他层的小标量"没画出来？
+
+两层原因：
+1. **行都存在，但是否上色取决于该层是否真的访问了它**。实测：`w13_weight_scale_2`（2KB）**48 层全部访问**；`w13_input_scale`（2KB）**48 层都没访问**（永不显示）。
+2. **渲染分辨率吃掉了 1 行小张量**：`v5_layers_aligned_clean.png` 共 4265 行，渲染高度约 2080 像素（≈2 行/像素）；2KB 张量只占 1 行≈半像素，下采样时被吃掉/成噪点。对比断轴图给每单元最小 40 行，所以那里看得清楚。
+
+## Q25. L24 的 62 个 kernel 分别是什么？L24 的算子及其对应？
+
+L24 = **线性注意力(GDN) + MoE**。62 个 kernel（token3）按执行顺序分组：
+
+- **[0]–[12] 输入 RMSNorm + 量化**：direct_copy/add_/elementwise/bf16_copy，`pow`+`reduce_mean`+`rsqrt` = RMSNorm；copy/cat/fill 做 reshape。（不读权重）
+- **[13]–[27] GDN 线性注意力**：
+  - [13] cutlass wmma GEMM = **in_proj**(in_proj_qkvz)
+  - [14] gemvx（小）
+  - [23] `causal_conv1d_update` = GDN 短卷积
+  - [24] `fused_recurrent_gated_delta_rule` = GDN 门控 delta-rule 递推
+  - [25] `layer_norm_fwd` = GDN 门控 RMSNorm
+  - [26] `cvt_fp16_to_fp4` = 量化注意力输出
+  - [27] cutlass GEMM = **out_proj**
+- **[28]–[41] post_attention RMSNorm + 量化**：与 A 段同构；[41] `cvt_fp16_to_fp4` 量化 MoE 输入。
+- **[42]–[49] shared expert（稠密）**：[42] cutlass GEMM=gate_up；[43] `act_and_mul`(SiLU×门)；[44] 量化；[45] cutlass GEMM=down；[46] cublas dot；[47] reduce_1Block；[48] sigmoid；[49] elementwise（sigmoid 门控合并）。
+- **[50]–[61] 路由 + 路由专家 MoE**：
+  - [50] gemvx(66048) = **router 门控**（读 mlp.gate）
+  - [51] `topkGating` = 选 top-10
+  - [52] `cvt_fp16_to_fp4` 量化
+  - [53]–[55] block/global/merge `ExpertPrefixSum`（grouped GEMM 元数据）
+  - [56] `expandInputRows` 按专家展开 token
+  - [57] `computeStridesTma` 计算 TMA strides
+  - [58] cutlass grouped GEMM = **专家 w13(gate+up)**
+  - [59] `doActivation` 专家 SiLU
+  - [60] cutlass grouped GEMM = **专家 w2(down)**
+  - [61] elementwise 合并
+
+映射到图：
+- 红 MoE=[58][60]（读 routed w13/w2，10/512 稀疏红条）；56.791/60.685 红点=量化标量
+- 橙 attention=[13][23][24][27]
+- 紫 shared=[42][43][45][49]
+- 蓝 norm/路由=[50]（router）+ 各 RMSNorm 权重
+- 灰 激活/workspace=其余 copy/elementwise/quant/prefix-sum 等（不碰权重）
