@@ -111,3 +111,45 @@ v4 只抓了普通 load/store（LDG/STG 等），**漏掉了 CUTLASS GEMM 通过
 `analyze_aligned2.py`（精确归属+对齐+清洗）、`plot_aligned.py`/`plot_aligned_clean.py`（层热图）、`plot_broken.py`（断轴单层图）、`plot_kvact.py`（KV/激活热图）。
 
 > 注：如需**根修** TMA 对 grouped-GEMM 的地址解析（而非事后剔除），需改 `hbm_trace` 并重抓一次（约 126GB；当前剩 168GB 可容纳）。对分析而言事后剔除已足够。
+
+## 十、从 trace 到 FPGA 仿真激励的转化方案
+
+目标：为 FPGA 硬件仿真平台（Host FPGA → HBM FPGA，用 MB 级 SRAM 模拟 HBM）提供**统计等价的 decode 访存激励**。原始 125GB trace / 80GB 地址空间**不能直接作为输入**，需抽象为"访存特性指纹 + 生成器"。
+
+### 管线
+```
+真实 trace → ①特征提取 → ②地址/容量抽象 → ③激励生成 → ④校准验证 ↺
+```
+交付给 FPGA 的是**紧凑描述符 + 生成器**（KB~MB 级），而非原始 trace。
+
+### ① 提取的"访存特性指纹"
+- 对象/类型：权重(MoE 43.5GB=91.9%、attn 2.5GB、lmhead/embed 各 0.62GB)、KV(25GB 池)、激活/workspace 的**字节/请求占比**。
+- 请求粒度：LD/ST size 与 coalesced 事务；TMA tile 的 span/nelem（span 中位~1KB、max~260KB）→ size/run 长度分布。
+- 读写比（KV/激活写、权重读）。
+- 结构时序：每 token `emb→L0..47→out`；每层 `2×RMSNorm+GDN+shared+路由MoE`；每算子字节预算与突发性。
+- 局部性/复用：run 长度、复用距离、工作集。
+- 专家稀疏：每层每 token **10/512**、跨 token 并集增长（60 token≈39%/层）。
+- 地址→bank/row/col 分布（如知道目标 HBM 映射）：每 bank 请求数、行命中/冲突率。
+
+### ② 地址/容量抽象（统计等价映射）
+- 定义模拟 DRAM 几何 `channels×banks×rows×cols×burst`，总容量=FPGA SRAM。
+- 真实地址 → 模拟地址：**保留低位(burst/col)与 bank 交错规律**，高位用受限范围/哈希压缩：`addr_sim = f(col, bank=hash(中位), row=hash(高位))`。
+- 目标：生成流的**每 bank 分布、行命中/冲突率、size 分布**与真实 trace 统计一致（专家"大范围分散读"通过"专家槽↔bank 交错映射"体现，无需真存 80GB）。
+
+### ③ 激励生成（三方案，推荐 C+A 混合）
+- **A 统计生成器**：按 `(layer,算子)` 的请求数/size/run/读写/落点分布采样生成；地址用抽象对象表缩放到 MB。输入极小、可实时生成。
+- **B 精简回放/地址折叠**：抽代表片段或哈希折叠地址，保留顺序与粒度；时序最真但体积大、折叠需校准。
+- **C 结构化模型感知**：用层/算子模板复刻序列，专家路由用热度分布、KV 按上下文增长建模；语义最真、易扩展长上下文。
+- 给 FPGA 的每条激励：`{cycle, op(R/W), addr_sim, size, burst, type, src(TMA/LSU)}`；可"描述符+RNG 实时生成"或"预生成紧凑 delta 二进制流"。
+
+### ④ 校准验证
+- 指标：size 分布、TMA/LSU 比、读写比、run 长度、复用距离、每 bank 请求数、**行命中率**、bank 冲突率、并发度、每 token/层字节。
+- 闭环：生成→跑 FPGA 模型→与 trace 目标对比→调映射/并发/size 分布，迭代到误差达标。
+
+### 当前数据不足，建议补采
+长上下文 KV（512/2K/4K）、专家并集与路由热度分布、lm_head/采样占比、必要时 prefill。
+
+### 第一步可交付
+`traffic_profile.py`（输出每 `(layer,kernel-type)` descriptor JSON）+ `stim_gen.py`（按 descriptor+DRAM 几何生成激励，并自带与 trace 目标对比报告）。
+
+> 待确认（影响方案收敛）：①FPGA 需要的是"地址+读写+size 流量激励"还是"真实数据搬移"；②目标存储模型是完整 HBM 时序(bank/row)还是仅带宽，容量与 bank 数。
