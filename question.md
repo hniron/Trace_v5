@@ -386,3 +386,74 @@ L24 = **线性注意力(GDN) + MoE**。62 个 kernel（token3）按执行顺序�
 - 紫 shared=[42][43][45][49]
 - 蓝 norm/路由=[50]（router）+ 各 RMSNorm 权重
 - 灰 激活/workspace=其余 copy/elementwise/quant/prefix-sum 等（不碰权重）
+
+---
+
+# 附：decode / prefill 的 token 生成过程
+
+## Q26. decode 阶段，token 是如何一步步生成的？（并纠正常见误解）
+
+- **Prefill**：整段 prompt 一次并行过 48 层，同时把每层每个 prompt token 的 K/V 写入 KV cache；用**最后一个 prompt 位置**的输出 → final norm → lm_head → logits → 采样，得到**第 1 个生成 token（token0）**。
+- **Decode**：之后每步只处理 1 个新 token。token0→token1，token1→token2……
+
+一个 decode step（输入 token0 → 生成 token1）：
+1. Embedding：token0 id → `h (1×d)`。
+2. 逐层 l=0..47：
+   - `h_in = RMSNorm(h)`
+   - `Q = h_in·Wq_l`、`K_new = h_in·Wk_l`、`V_new = h_in·Wv_l`（**Q/K/V 都是当前 hidden × 该层投影权重**）
+   - **把 K_new,V_new 追加进该层 KV cache**
+   - `Q` attends 该层**所有历史 K/V**（prompt + 已生成）→ 上下文 → `·Wo_l`，残差
+   - `h_in2 = RMSNorm(h)`；MoE：router → **top-10 专家** + shared expert 算 FFN；残差
+3. 第 47 层后：`final norm → lm_head → logits → 采样 → token1`。token1 作为下一步输入。
+
+纠正：
+- 采出的 id **就是 token0**（不是"据 token0 再得到 token0"）。
+- **Q、K、V 都由 `hidden × 该层 Wq/Wk/Wv` 得到**，不是 Q 产生 K/V。
+- 每层有**各自**的 Wq/Wk/Wv 与 KV cache。
+- **关键易漏点**：新 token 的 Q 要和该层**所有历史 K/V**（prompt+已生成）做注意力，才有上下文。
+- 只有 FFN(MoE) 稀疏（top-10）；attention 权重是稠密的。
+
+KV 增长（以全注意力层为例，prompt 长 P）：
+| 步骤 | 输入 | 追加 K/V | Q 能看到的 K/V |
+|---|---|---|---|
+| 生成 token0 | prefill 并行 | prompt 的 P 个 | 最后一个 prompt 位置看全部 prompt |
+| 生成 token1 | token0 | token0 | prompt + token0 |
+| 生成 token2 | token1 | token1 | prompt + token0 + token1 |
+
+> 本模型 Qwen3-Next 是混合注意力：12 个全注意力层有增长的 KV；36 个 GDN 线性注意力层维护**固定递推状态**（不随上下文增长）。
+
+## Q27. prefill 与 decode 的区别？其它位置 logits 有用吗？多个 token 的 Q 会互相 attend 吗？上下文范围？
+
+### prefill 详细流程（N 个 prompt token 一次过 48 层）
+1. Embedding → `H (N×d)`
+2. 每层：`H_in=RMSNorm(H)`；`Q=H·Wq, K=H·Wk, V=H·Wv`（N×d）；`S=QKᵀ/√d`（N×N）加**因果掩码**、softmax；`ctx=A·V`；`·Wo`+残差；存该层 K,V 进 KV cache；`RMSNorm` 后 MoE（每 token 各自 top-10，grouped GEMM 批量）+残差。
+3. 48 层后 `H(N×d) → final norm → lm_head → logits(N×V)`，**只用最后一个位置的 logits 采样出 token0**。
+
+### 与 decode 的区别
+| | prefill | decode |
+|---|---|---|
+| 输入 | N 个 token 一起 | 1 个 token |
+| 注意力形状 | `N×(cache+N)`，新 token 间有 `N×N` 因果块 | `1×(cache+1)` |
+| 谁看谁 | token i 看 j≤i（因果，看前缀含自己） | 新 token 看全部历史 |
+| 权重读取 | 一次服务 N token（摊销） | 每步重读全部权重 |
+| 瓶颈 | 计算密集(大 GEMM) | 访存密集 |
+| KV | 一次写入 N 个 | 每步追加 1 个 |
+| logits | N×V，只用最后一个 | 1×V 直接采样 |
+
+### 其它位置 logits 有用吗？
+**生成时没用。** 位置 i 的 logits 是"看过 prompt[0..i] 后对下一个词的预测"；生成 token0 只需要"看完整段 prompt"后（最后位置）的下一个词。其它位置是**训练时的监督目标**，推理生成丢弃（很多实现只对最后位置算 lm_head 以省算力）。
+
+### 多个 token 的 Q 会互相 attend 吗？
+**会，但因果。** 同层内 N 个 token 的 Q/K/V 一起算，`Q_i` 与 `K_j (j≤i)` 做点积（因果掩码屏蔽未来）。所以 prefill 一次就把整段上下文建立起来；decode 只有 1 个 Q，看全部历史。
+
+### "整段上下文"到底包含什么？
+取决于输入序列/KV 里有啥：
+- **单轮、不保留历史 KV**：token i 只看**当前 prompt 的前缀**（如"今天天气真好"拆 6 token，token"好"看这 6 个；token"真"看不到"好"）。
+- **多轮、拼历史或保留 KV cache**：前缀 = **历史对话 + 之前生成的 token + 当前 prompt 前缀**；此时 token"好"确实看全部历史。
+- 注意：token i **看不到未来**；历史只有被放进序列/KV 才可见。
+
+### 为什么"看起来 prefill 和 decode 的 attention 没区别"
+**可见性/数学上确实一样**（都是因果 `softmax(QKᵀ)V`，都看前缀）。区别在**一次处理几个 query、是否 token 间互相注意、以及 compute/memory 模式**：prefill 是 N 个 token 一批、含 N×N 因果互注意、计算密集；decode 是 1 个 token 读长历史、访存密集。
+
+## Q28. 与 trace 的关系
+我们的 trace 是 **decode-only**（`seq_len==1` 时才 arm），**未抓 prefill**。prefill 访存特性与 decode 不同（计算密集、大突发、一次读全权重、KV 批量写入）；若 FPGA 也需模拟 prefill，需单独采集 prefill trace 或用同方法建模。
