@@ -122,14 +122,39 @@ v4 只抓了普通 load/store（LDG/STG 等），**漏掉了 CUTLASS GEMM 通过
 ```
 交付给 FPGA 的是**紧凑描述符 + 生成器**（KB~MB 级），而非原始 trace。
 
-### ① 提取的"访存特性指纹"
-- 对象/类型：权重(MoE 43.5GB=91.9%、attn 2.5GB、lmhead/embed 各 0.62GB)、KV(25GB 池)、激活/workspace 的**字节/请求占比**。
-- 请求粒度：LD/ST size 与 coalesced 事务；TMA tile 的 span/nelem（span 中位~1KB、max~260KB）→ size/run 长度分布。
-- 读写比（KV/激活写、权重读）。
-- 结构时序：每 token `emb→L0..47→out`；每层 `2×RMSNorm+GDN+shared+路由MoE`；每算子字节预算与突发性。
-- 局部性/复用：run 长度、复用距离、工作集。
-- 专家稀疏：每层每 token **10/512**、跨 token 并集增长（60 token≈39%/层）。
-- 地址→bank/row/col 分布（如知道目标 HBM 映射）：每 bank 请求数、行命中/冲突率。
+### ① 提取"访存特性指纹"（通俗详细版）
+
+**什么是"指纹"**：原始 trace 像"所有工人进出仓库的完整监控录像"（125GB）；**指纹 = 从录像里总结出的行为画像**——每层、每类操作，**读/写什么类型、一次搬多大、是"整块搬"还是"东一块西一块"、读还是写、多少并发、落在哪些抽屉(bank/row)**。它很小（KB~MB），却足以让 FPGA 在小仓库里复刻同样的"忙碌/冲突/命中"节奏。
+
+**怎么提取（分步）**：
+- **Step0 分桶**：按"层 + 阶段 + 算子类型"分组，如 (L24, MoE GEMM)、(L24, attention/GDN)、(output, lm_head)、(L24, norm)。
+- **Step1 逐条贴标签**：每条记录 → ①谁在读(层/kernel)②读什么(用地址查 allocator_map：MoE/attn/KV/激活)③多大怎么搬(LD/ST size、TMA span/nelem)④读/写。
+- **Step2 每桶算画像指标**（即指纹）：
+  1. **请求大小分布**：LD/ST size 直方图；TMA 每次搬运字节数直方图。
+  2. **连续性(run 长度)**：把相邻地址合并成连续块，统计"一次连续搬多少"（区分整块大搬运 vs 碎小随机读）。
+  3. **空间散度**：在对象内摊多大范围、几个位置（例：MoE 是 512 个 1.77MB 槽里只碰 10 个）。
+  4. **读写比**：权重=读；KV/激活有写。
+  5. **时间局部性/复用**：同一地址重复访问的间隔（复用距离）。
+  6. **并发度**：多少 CTA/warp 同时发请求（grid/cta/warp），决定能否打满内存。
+  7. **地址→bank/row/col 分布**（若知目标 HBM 映射）：每 bank 请求数、行命中 vs 行冲突比例。
+  8. **每层/每阶段字节预算与突发性**。
+
+**指纹示例（本项目真实数据）**：
+```jsonc
+// L24 MoE（grouped GEMM）
+{ "type":"moe", "read_bytes":17.7e6, "n_bursts":10, "burst_bytes":1.77e6,
+  "contiguity":"每段连续", "spatial":"512槽中散选10个,落在906MB内", "rw":"read" }
+// L24 attention/GDN
+{ "type":"attn", "read_bytes":55.4e6, "contiguity":"整块连续", "rw":"read" }
+// output lm_head
+{ "type":"lmhead", "read_bytes":0.62e9, "contiguity":"整块连续", "rw":"read" }
+// 激活/workspace
+{ "type":"act", "size":"小且瞬时", "reuse":"层间复用同一批地址" }
+```
+
+**规模参考（每 token）**：确定性权重≈3.3GB（attention/GDN 2.5 + shared 0.09 + norm/router 0.10 + lm_head 0.62）；MoE 专家≈0.85GB（10/512×48）；合计≈4.2GB/token。
+
+> 全部桶加起来，一个模型 decode 的指纹也就几百个桶 × 十几项统计，非常小；这是后续"地址抽象→激励生成→校准"的输入。
 
 ### ② 地址/容量抽象（统计等价映射）
 - 定义模拟 DRAM 几何 `channels×banks×rows×cols×burst`，总容量=FPGA SRAM。
