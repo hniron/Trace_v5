@@ -457,3 +457,52 @@ KV 增长（以全注意力层为例，prompt 长 P）：
 
 ## Q28. 与 trace 的关系
 我们的 trace 是 **decode-only**（`seq_len==1` 时才 arm），**未抓 prefill**。prefill 访存特性与 decode 不同（计算密集、大突发、一次读全权重、KV 批量写入）；若 FPGA 也需模拟 prefill，需单独采集 prefill trace 或用同方法建模。
+
+---
+
+## Q29. 相邻层 top-10 专家高偏移相似做预取是否可行？attention/GDN 确定性预取对应哪一阶段？一个专家多大？
+
+**提问（用户原意）**：每层 MoE 内 0–512MB 每 1MB 一个专家、布局相同；若第 k 层和第 k+1 层激活相同索引的专家（如 3,10,8,9…），则相对层基址偏移相同，能否据此预取第 k+1 层 MoE 权重做计算-IO 掩盖？另：attention/GDN 是每 token 每层必读、地址固定的权重，是否可预取？它对应解码流程哪个阶段？以及 0.85GB/token 是否意味着单专家 85MB（与之前"约1MB"矛盾）？
+
+**回答：**
+
+### 1. 预取想法理解无歧义，但前提被数据否定
+- 你描述的正是"每层 MoE 布局相同、专家索引相同则偏移相同 → 可预取"。
+- 实测（同一 token、相邻两层 top-10 专家集合，57 token，L0–L46 全部相邻层对）：
+  - 平均交集 **0.19/10**，平均 Jaccard **0.0101**；随机基线 Jaccard **0.0099**。
+  - 即**相邻两层选中的专家几乎完全无关（≈随机）** → 用第 k 层偏移预取第 k+1 层命中率≈2%，**该具体路径不可行**。
+
+### 2. 确定性权重可预取（才是大头）
+不同层 attention/GDN 权重不同，但 decode 每 token 每层必读、地址固定 → **无需预测即可逐层预取/双缓冲**。
+
+| 每 token 读取 | 大小(全48层) | 内容相关? | 可直接预取 |
+|---|---|---|---|
+| attention/GDN 权重 | ~2.5GB | 否(必读) | ✅ 固定地址逐层预取 |
+| shared_expert(稠密) | ~0.09GB | 否 | ✅ |
+| norm/路由门控(mlp.gate) | ~0.10GB | 否 | ✅ |
+| lm_head(输出层) | ~0.62GB | 否 | ✅ 每 token 一次 |
+| MoE 路由专家 | ~0.85GB(10/512×48) | **是** | ❌ 难(≈随机,需预测/热点缓存) |
+| 合计 | **≈4.2GB/token** | | |
+
+→ 可预取主角是 **attention/GDN + shared + norm/router + lm_head(≈3.3GB/token，确定性)**；MoE 专家仅 0.85GB 且不可预测。
+
+### 3. attention/GDN 在 62-kernel 流程中的阶段
+- **阶段 [13]–[27]（注意力块，L24 为 GDN）**：
+  - [13] cutlass wmma GEMM = in_proj(in_proj_qkvz.weight)
+  - [23] causal_conv1d_update = conv1d.weight
+  - [24] fused_recurrent_gated_delta_rule = A_log/dt_bias
+  - [25] layer_norm_fwd
+  - [27] cutlass GEMM = out_proj
+- 读的是 `linear_attn.*` 约 55MB/层，确定性、每 token 必读、地址固定。
+- 其余对应：norm=[0]–[12]/[28]–[40]；shared=[42]–[49]；路由=[50]；MoE 专家=[58][60]；lm_head 在层外 output 阶段。
+
+### 4. 纠正算术：一个专家 ≈ 1.77MB，不是 85MB
+- 每层 10 专家：`10×(w13 1.05MB + w2 0.52MB + w13_scale 0.13MB + w2_scale 0.065MB) ≈ 17.7MB/层`
+- 48 层：`17.7MB×48 ≈ 0.85GB/token`
+- 单专家 slice = `0.85GB/(48×10)` = **≈1.77MB**（此前"约1MB"指 w13 部分）。即 0.85GB 是"48 层 × 10 专家"总读量，不能只除以 10。
+
+### 结论
+- 预取框架理解无歧义；但"相邻层同索引专家"前提**数据否定（≈随机）**。
+- 确定性 attention/GDN(+shared+norm+router+lm_head，约 3.3GB/token)**值得且可逐层预取**（对应第 k+1 层 [13][23][24][25][27]）。
+- MoE 专家(0.85GB/token，单专家≈1.77MB)不可用相邻层偏移预测；需热点专家缓存/学习型预测。
+- decode 多为带宽受限，预取治延迟/未打满带宽；确定性权重逐层预取最稳、收益最大。
